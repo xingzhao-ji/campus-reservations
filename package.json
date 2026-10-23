@@ -1,0 +1,33 @@
+{
+  "name": "campus-reservations",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --import tsx src/server.ts",
+    "build": "tsc && tsc -p tsconfig.web.json && vite build",
+    "start": "node dist/server.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "migrate": "node --import tsx src/migrate.ts",
+    "worker": "node --import tsx src/worker.ts",
+    "demo:embedded": "node --import tsx src/demo.ts"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "pg": "^8.16.3",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.3.10",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.0.0",
+    "@types/pg": "^8.15.5",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "prettier": "^3.9.10",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}

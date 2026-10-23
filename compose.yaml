@@ -1,0 +1,40 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: campus
+      POSTGRES_PASSWORD: local_demo_only
+      POSTGRES_DB: campus
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - campus_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U campus -d campus"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://campus:local_demo_only@db:5432/campus
+      DEMO_MODE: "true"
+      PORT: 3101
+    ports:
+      - "127.0.0.1:3101:3101"
+    depends_on:
+      db:
+        condition: service_healthy
+  worker:
+    build: .
+    command: ["node", "dist/worker.js"]
+    environment:
+      DATABASE_URL: postgres://campus:local_demo_only@db:5432/campus
+    depends_on:
+      app:
+        condition: service_started
+    restart: on-failure
+volumes:
+  campus_data:

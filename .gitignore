@@ -1,0 +1,8 @@
+node_modules/
+dist/
+public/
+.env
+*.log
+.test-db/
+
+.demo-db/
