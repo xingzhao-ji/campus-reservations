@@ -23,11 +23,12 @@ export class Reservations {
   }
   async expireAndPromote(c: Connection, slotId: string, capacity: number) {
     const expired = await c.query(
-      `UPDATE reservations SET state='expired',expires_at=NULL WHERE slot_id=$1 AND state='held' AND expires_at<=clock_timestamp() RETURNING id,principal`,
+      `UPDATE reservations r SET state='expired',expires_at=NULL FROM slots s WHERE r.slot_id=$1 AND s.id=r.slot_id AND ((r.state='held' AND r.expires_at<=clock_timestamp()) OR (r.state IN ('held','waitlisted') AND s.starts_at<=clock_timestamp())) RETURNING r.id,r.principal`,
       [slotId],
     );
     for (const r of expired.rows)
       await this.event(c, "reservation.expired", { ...r, slotId });
+    if (!(await this.bookingOpen(c, slotId))) return;
     const used = await c.query(
       `SELECT count(*)::int AS n FROM reservations WHERE slot_id=$1 AND state IN ('held','confirmed')`,
       [slotId],
@@ -39,12 +40,23 @@ export class Reservations {
       [slotId, free],
     );
     for (const r of waiting.rows) {
-      await c.query(
-        `UPDATE reservations SET state='held',expires_at=clock_timestamp()+($2*interval '1 second') WHERE id=$1`,
+      const promoted = await c.query(
+        `UPDATE reservations r SET state='held',expires_at=LEAST(s.starts_at,clock_timestamp()+($2*interval '1 second')) FROM slots s WHERE r.id=$1 AND s.id=r.slot_id AND s.starts_at>clock_timestamp() RETURNING r.id`,
         [r.id, this.holdSeconds],
       );
-      await this.event(c, "reservation.promoted", { ...r, slotId });
+      if (promoted.rows.length)
+        await this.event(c, "reservation.promoted", { ...r, slotId });
     }
+  }
+  async bookingOpen(c: Connection, id: string): Promise<boolean> {
+    return (
+      (
+        await c.query(
+          "SELECT starts_at>clock_timestamp() AS open FROM slots WHERE id=$1",
+          [id],
+        )
+      ).rows[0]?.open === true
+    );
   }
   async lockSlot(c: Connection, id: string) {
     const { rows } = await c.query(
@@ -104,7 +116,7 @@ export class Reservations {
   }
   async hold(c: Connection, p: Principal, slotId: string): Promise<Result> {
     const slot = await this.lockSlot(c, slotId);
-    if (new Date(slot.starts_at).getTime() <= Date.now())
+    if (!(await this.bookingOpen(c, slotId)))
       throw new Problem(409, "This session has started");
     const active = (
       await c.query(
@@ -123,10 +135,11 @@ export class Reservations {
     const state = n < slot.capacity ? "held" : "waitlisted";
     const r = (
       await c.query(
-        `INSERT INTO reservations(id,slot_id,principal,state,expires_at) VALUES($1,$2,$3,$4,CASE WHEN $4='held' THEN clock_timestamp()+($5*interval '1 second') END) RETURNING *`,
+        `INSERT INTO reservations(id,slot_id,principal,state,expires_at) SELECT $1,$2,$3,$4,CASE WHEN $4='held' THEN LEAST(s.starts_at,clock_timestamp()+($5*interval '1 second')) END FROM slots s WHERE s.id=$2 AND s.starts_at>clock_timestamp() RETURNING *`,
         [randomUUID(), slotId, p.id, state, this.holdSeconds],
       )
     ).rows[0];
+    if (!r) throw new Problem(409, "This session has started");
     await this.event(c, `reservation.${state}`, {
       id: r.id,
       slotId,
@@ -150,6 +163,8 @@ export class Reservations {
     const slot = await this.lockSlot(c, initial.slot_id);
     const r = (await c.query("SELECT * FROM reservations WHERE id=$1", [id]))
       .rows[0];
+    if (action === "confirm" && !(await this.bookingOpen(c, slot.id)))
+      throw new Problem(409, "This session has started");
     if (action === "confirm" && r.state !== "held")
       throw new Problem(409, "Only a live hold can be confirmed");
     if (
@@ -160,10 +175,12 @@ export class Reservations {
     const state = action === "confirm" ? "confirmed" : "cancelled";
     const changed = (
       await c.query(
-        "UPDATE reservations SET state=$2,expires_at=NULL WHERE id=$1 RETURNING *",
+        `UPDATE reservations r SET state=$2,expires_at=NULL FROM slots s WHERE r.id=$1 AND s.id=r.slot_id AND ($2='cancelled' OR (s.starts_at>clock_timestamp() AND r.state='held' AND r.expires_at>clock_timestamp())) RETURNING r.*`,
         [id, state],
       )
     ).rows[0];
+    if (!changed)
+      throw new Problem(409, "The hold or booking window has expired");
     await this.event(c, `reservation.${state}`, {
       id,
       slotId: slot.id,
@@ -175,7 +192,7 @@ export class Reservations {
   async sweep() {
     const slots = (
       await this.db.query(
-        `SELECT DISTINCT slot_id FROM reservations WHERE state='held' AND expires_at<=clock_timestamp()`,
+        `SELECT DISTINCT r.slot_id FROM reservations r JOIN slots s ON s.id=r.slot_id WHERE (r.state='held' AND r.expires_at<=clock_timestamp()) OR (r.state IN ('held','waitlisted') AND s.starts_at<=clock_timestamp())`,
       )
     ).rows;
     for (const s of slots)
@@ -185,7 +202,7 @@ export class Reservations {
   async list(p: Principal) {
     return (
       await this.db.query(
-        `SELECT s.*,count(r.id) FILTER(WHERE r.state IN ('held','confirmed'))::int AS occupied,count(r.id) FILTER(WHERE r.state='waitlisted')::int AS waiting, (SELECT row_to_json(m) FROM reservations m WHERE m.slot_id=s.id AND m.principal=$1 AND m.state IN ('held','confirmed','waitlisted') LIMIT 1) AS mine FROM slots s LEFT JOIN reservations r ON r.slot_id=s.id GROUP BY s.id ORDER BY s.starts_at`,
+        `SELECT s.*,s.starts_at>clock_timestamp() AS booking_open,count(r.id) FILTER(WHERE r.state IN ('held','confirmed'))::int AS occupied,count(r.id) FILTER(WHERE r.state='waitlisted')::int AS waiting, (SELECT row_to_json(m) FROM reservations m WHERE m.slot_id=s.id AND m.principal=$1 AND m.state IN ('held','confirmed','waitlisted') LIMIT 1) AS mine FROM slots s LEFT JOIN reservations r ON r.slot_id=s.id GROUP BY s.id ORDER BY s.starts_at`,
         [p.id],
       )
     ).rows;

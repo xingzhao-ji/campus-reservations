@@ -1,3 +1,4 @@
+import { bookingClosed, reservationNotice } from "./presentation.js";
 import { idempotencyKey } from "./keys.js";
 import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
@@ -11,6 +12,7 @@ type Slot = {
   occupied: number;
   waiting: number;
   starts_at: string;
+  booking_open: boolean;
   ends_at: string;
   mine: Reservation | null;
 };
@@ -139,9 +141,9 @@ function App() {
     setError("");
     setNotice("");
     try {
-      await api(path, body);
+      const result = await api(path, body);
       await refresh();
-      setNotice(message);
+      setNotice(path.endsWith("/holds") ? reservationNotice(result) : message);
       return true;
     } catch (e: any) {
       setError(e.message);
@@ -151,12 +153,14 @@ function App() {
     }
   }
   const mine = slots.filter((s) => s.mine),
-    available = slots.filter((s) => s.occupied < s.capacity),
+    available = slots.filter(
+      (s) => !bookingClosed(s, now) && s.occupied < s.capacity,
+    ),
     visible = slots.filter((s) =>
       filter === "mine"
         ? s.mine
         : filter === "available"
-          ? s.occupied < s.capacity
+          ? !bookingClosed(s, now) && s.occupied < s.capacity
           : true,
     );
   async function create(e: React.FormEvent<HTMLFormElement>) {
@@ -400,6 +404,7 @@ function App() {
                 </div>
                 <div className="cards">
                   {visible.map((s, i) => {
+                    const closed = bookingClosed(s, now);
                     const seconds = s.mine?.expires_at
                       ? Math.max(
                           0,
@@ -432,13 +437,15 @@ function App() {
                               })}
                             </span>
                             <span
-                              className={`badge ${s.mine?.state === "confirmed" ? "green" : s.occupied >= s.capacity ? "neutral" : ""}`}
+                              className={`badge ${closed ? "neutral" : s.mine?.state === "confirmed" ? "green" : s.occupied >= s.capacity ? "neutral" : ""}`}
                             >
-                              {s.mine?.state === "confirmed"
-                                ? "You’re booked"
-                                : s.occupied >= s.capacity
-                                  ? "Waitlist open"
-                                  : `${s.capacity - s.occupied} spots left`}
+                              {closed
+                                ? "Bookings closed"
+                                : s.mine?.state === "confirmed"
+                                  ? "You’re booked"
+                                  : s.occupied >= s.capacity
+                                    ? "Waitlist open"
+                                    : `${s.capacity - s.occupied} spots left`}
                             </span>
                           </div>
                           <h3>{s.title}</h3>
@@ -465,7 +472,33 @@ function App() {
                               value={s.occupied}
                             />
                           </div>
-                          {s.mine?.state === "held" ? (
+                          {closed ? (
+                            <div className="reservation-actions">
+                              <p className="booked-note">
+                                {s.mine?.state === "confirmed"
+                                  ? "Confirmed reservation · booking is closed"
+                                  : "This session is closed for bookings."}
+                              </p>
+                              {s.mine?.state === "confirmed" ? (
+                                <button
+                                  className="button outline"
+                                  disabled={!!busy}
+                                  onClick={() =>
+                                    act(
+                                      s.id,
+                                      `/reservations/${s.mine!.id}/cancel`,
+                                    )
+                                  }
+                                >
+                                  Cancel reservation
+                                </button>
+                              ) : (
+                                <button className="button outline" disabled>
+                                  Bookings closed
+                                </button>
+                              )}
+                            </div>
+                          ) : s.mine?.state === "held" ? (
                             <div className="reservation-actions">
                               <p className="hold-clock">
                                 <Icon name="clock" size={15} />
@@ -537,14 +570,7 @@ function App() {
                               disabled={!!busy}
                               className="button reserve"
                               onClick={() =>
-                                act(
-                                  s.id,
-                                  `/slots/${s.id}/holds`,
-                                  {},
-                                  s.occupied < s.capacity
-                                    ? "Your place is held for two minutes. Confirm to keep it."
-                                    : "You’re on the waitlist. We’ll offer a hold here when a place opens.",
-                                )
+                                act(s.id, `/slots/${s.id}/holds`, {})
                               }
                             >
                               <span>
@@ -582,9 +608,10 @@ function App() {
                 <span className="info-mark">i</span>
                 <p>
                   <strong>A moment to make it yours.</strong> Places are held
-                  for two minutes. Confirm before the timer ends. If a session
-                  is full, join the waitlist — the next person gets a fresh hold
-                  when a place opens.
+                  for up to two minutes, ending when the session starts. Confirm
+                  before the timer ends. If a session is full, join the waitlist
+                  — the next person gets a fresh hold when a place opens before
+                  the session starts.
                 </p>
               </div>
               {me?.role === "admin" && (

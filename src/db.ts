@@ -11,7 +11,19 @@ export interface Database {
 }
 export function database(url = process.env.DATABASE_URL): Database {
   if (!url) throw new Error("DATABASE_URL is required");
-  return new pg.Pool({ connectionString: url, max: 30 }) as Database;
+  const pool = new pg.Pool({
+    connectionString: url,
+    max: 30,
+    connectionTimeoutMillis: 2000,
+    query_timeout: 5000,
+  });
+  // pg-pool removes failed idle clients before emitting this event. Keep the
+  // process alive so its next query can obtain a replacement connection.
+  // Never log the error/client: driver messages can contain connection secrets.
+  pool.on("error", () => {
+    console.error("Database idle connection lost; will reconnect on demand");
+  });
+  return pool as Database;
 }
 export async function tx<T>(
   db: Database,

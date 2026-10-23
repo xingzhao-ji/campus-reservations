@@ -61,14 +61,18 @@ Coverage includes:
 - Closing/reopening database connections and replaying the committed response. This is connection restart/persistence testing, not a power-loss test.
 - Abandoned leases, redelivery, stale acknowledgement fencing, and disjoint parallel worker claims.
 - HTTP auth, member/admin boundaries, cross-member privacy, payload bounds and the complete hold/confirm flow.
+- Booking closure at start, restart catch-up without late offers, capped hold deadlines, and closed-session UI decisions.
+- Real pg-pool idle-client removal/replacement and credential-free logging; readiness outage/recovery. A live `pg_terminate_backend` reconnection test runs only with TEST_DATABASE_URL and is explicitly skipped in embedded mode.
 
 ## Transaction model
 
-Every capacity transition locks the slot with `SELECT ... FOR UPDATE`. Expiration runs under that same lock, then promotes the oldest waitlist entries into fresh holds. `held + confirmed <= capacity` holds across all service mutations. A partial unique index allows only one active reservation per principal per slot. Capacity is immutable after slot creation.
+Every capacity transition locks the slot with `SELECT ... FOR UPDATE`. Expiration runs under that same lock, then promotes the oldest waitlist entries into fresh holds while booking remains open. `held + confirmed <= capacity` holds across all service mutations. A partial unique index allows only one active reservation per principal per slot. Capacity is immutable after slot creation. Booking closes at `starts_at` according to the database clock: no new holds/waitlists, offers or confirmations are allowed at or after that boundary. Holds are capped at the session start; closure expires outstanding holds and waitlist entries, preserving confirmed history and its cancellation path. The UI marks started sessions closed.
 
 Mutations require `Idempotency-Key` (8–128 safe characters). A transaction-level advisory lock serializes `(principal, key)`, checks the stored request payload, then commits the result, reservation changes and outbox events together. Reusing a key with a different request returns 409. Business errors are stored as stable responses; retry with a new key for a new attempt. Keys are retained indefinitely in this MVP. A replay returns the original response, even if the reservation has since changed; the UI refreshes current state separately.
 
 Expiry sweeps run every second in the server. With the server stopped, expiry waits until restart or the next mutation of that slot. Reads can briefly show a hold that has reached its deadline; confirmation always rechecks under the slot lock. Queue offers are visible in the app; there are no external notifications.
+
+The PostgreSQL pool handles idle connection failures with a generic message and opens replacement connections on demand. Connection acquisition is bounded to two seconds and queries to five seconds. `/health` returns 503 while its database probe fails and returns 200 on recovery; it never includes driver errors or credentials. Compose restarts the database and application unless explicitly stopped. An active failed mutation can be retried with the same idempotency key.
 
 Outbox delivery is **at least once**. Workers claim rows using `FOR UPDATE SKIP LOCKED`, attach a random lease token, and increment attempts. ACK requires the current unexpired token. If a worker crashes after its side effect and before ACK, the event is delivered again. Real consumers must deduplicate by event ID in their own durable side-effect transaction. The example worker only prints event metadata. There is no exactly-once delivery claim, ordering guarantee across workers, retry backoff or dead-letter queue.
 

@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: campus
       POSTGRES_PASSWORD: local_demo_only
@@ -16,6 +17,7 @@ services:
       retries: 20
   app:
     build: .
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgres://campus:local_demo_only@db:5432/campus
       DEMO_MODE: "true"

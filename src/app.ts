@@ -39,8 +39,13 @@ export function app(
     next();
   });
   app.get("/health", async (_req, res) => {
-    await service.db.query("SELECT 1");
-    res.json({ ok: true });
+    res.set("Cache-Control", "no-store");
+    try {
+      await service.db.query("SELECT 1");
+      res.json({ ok: true });
+    } catch {
+      res.status(503).json({ ok: false, error: "Database unavailable" });
+    }
   });
   app.get("/api/config", (_req, res) =>
     res.json({
@@ -147,8 +152,9 @@ export function app(
       return { status: 201, body: r };
     });
   });
-  app.post("/api/admin/expire", async (_req, res) => {
+  app.post("/api/admin/expire", async (req, res) => {
     admin(res);
+    exactBody(req.body ?? {}, []);
     res.json({ slots: await service.sweep() });
   });
   app.get("/api/admin/outbox", async (_req, res) => {

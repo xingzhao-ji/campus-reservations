@@ -286,6 +286,11 @@ test("HTTP end-to-end: auth, validation, roles, hold/confirm/replay and privacy"
     assert.equal((await request("/api/slots")).status, 401);
     assert.equal((await request("/api/admin/outbox", "alex")).status, 403);
     assert.equal((await request("/api/slots", "alex", {})).status, 403);
+    assert.equal(
+      (await request("/api/admin/expire", "admin", { unexpected: true }))
+        .status,
+      400,
+    );
     const id = await slot(),
       key = randomUUID();
     const created = await request(`/api/slots/${id}/holds`, "alex", {}, key);
@@ -340,4 +345,120 @@ test("HTTP end-to-end: auth, validation, roles, hold/confirm/replay and privacy"
       server.close((e) => (e ? reject(e) : resolve())),
     );
   }
+});
+
+test("booking closes at database start time: no new hold, waitlist, or confirmation", async () => {
+  const id = await slot(2),
+    held = await hold(a, id);
+  await db.query("UPDATE slots SET starts_at=clock_timestamp() WHERE id=$1", [
+    id,
+  ]);
+  assert.equal((await hold(b, id)).status, 409);
+  assert.equal((await transition(a, held.body.id, "confirm")).status, 409);
+  assert.equal((await service.list(a))[0].booking_open, false);
+  assert.equal(
+    Number(
+      (
+        await db.query(
+          "SELECT count(*) n FROM outbox WHERE type='reservation.confirmed'",
+        )
+      ).rows[0].n,
+    ),
+    0,
+  );
+  const full = await slot();
+  await hold(a, full);
+  await db.query("UPDATE slots SET starts_at=clock_timestamp() WHERE id=$1", [
+    full,
+  ]);
+  assert.equal((await hold(b, full)).status, 409);
+  assert.equal(
+    (
+      await db.query(
+        "SELECT count(*)::int n FROM reservations WHERE state='waitlisted'",
+      )
+    ).rows[0].n,
+    0,
+  );
+});
+
+test("closed sessions expire outstanding offers without promotion and preserve confirmed history/cancel", async () => {
+  const id = await slot(),
+    held = await hold(a, id),
+    waiting = await hold(b, id);
+  await db.query(
+    "UPDATE slots SET starts_at=clock_timestamp()-interval '2 hours',ends_at=clock_timestamp()-interval '1 hour' WHERE id=$1",
+    [id],
+  );
+  await db.end();
+  db = openTestDatabase();
+  service = new Reservations(db);
+  await service.sweep();
+  const rows = (
+    await db.query(
+      "SELECT * FROM reservations WHERE slot_id=$1 ORDER BY queue_order",
+      [id],
+    )
+  ).rows;
+  assert.equal(rows.find((r) => r.id === held.body.id).state, "expired");
+  assert.equal(rows.find((r) => r.id === waiting.body.id).state, "expired");
+  assert.equal((await transition(b, waiting.body.id, "confirm")).status, 409);
+  assert.equal(
+    (
+      await db.query(
+        "SELECT count(*)::int n FROM outbox WHERE type='reservation.promoted'",
+      )
+    ).rows[0].n,
+    0,
+  );
+  const confirmedSlot = await slot(),
+    confirmed = await hold(a, confirmedSlot);
+  await transition(a, confirmed.body.id, "confirm");
+  await hold(b, confirmedSlot);
+  await db.query("UPDATE slots SET starts_at=clock_timestamp() WHERE id=$1", [
+    confirmedSlot,
+  ]);
+  assert.equal(
+    (
+      await db.query("SELECT state FROM reservations WHERE id=$1", [
+        confirmed.body.id,
+      ])
+    ).rows[0].state,
+    "confirmed",
+  );
+  assert.equal((await transition(a, confirmed.body.id, "cancel")).status, 200);
+  assert.equal(
+    (
+      await db.query(
+        "SELECT count(*)::int n FROM outbox WHERE type='reservation.promoted'",
+      )
+    ).rows[0].n,
+    0,
+  );
+});
+
+test("initial and promoted hold deadlines never exceed the database session start", async () => {
+  const id = await slot();
+  await db.query(
+    "UPDATE slots SET starts_at=clock_timestamp()+interval '30 seconds' WHERE id=$1",
+    [id],
+  );
+  const first = await hold(a, id),
+    second = await hold(b, id);
+  const start = (
+    await db.query("SELECT starts_at FROM slots WHERE id=$1", [id])
+  ).rows[0].starts_at;
+  assert.equal(
+    new Date(first.body.expires_at).getTime(),
+    new Date(start).getTime(),
+  );
+  await transition(a, first.body.id, "cancel");
+  const promoted = (
+    await db.query("SELECT * FROM reservations WHERE id=$1", [second.body.id])
+  ).rows[0];
+  assert.equal(promoted.state, "held");
+  assert.equal(
+    new Date(promoted.expires_at).getTime(),
+    new Date(start).getTime(),
+  );
 });
