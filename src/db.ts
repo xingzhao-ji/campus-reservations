@@ -2,7 +2,7 @@ import pg from "pg";
 export type QueryResult = { rows: any[]; rowCount?: number | null };
 export interface Connection {
   query(sql: string, params?: any[]): Promise<QueryResult>;
-  release(): void;
+  release(discard?: Error | boolean): void;
 }
 export interface Database {
   connect(): Promise<Connection>;
@@ -30,15 +30,23 @@ export async function tx<T>(
   fn: (c: Connection) => Promise<T>,
 ): Promise<T> {
   const c = await db.connect();
+  let discard = false;
   try {
     await c.query("BEGIN");
     const value = await fn(c);
     await c.query("COMMIT");
     return value;
   } catch (e) {
-    await c.query("ROLLBACK");
+    try {
+      await c.query("ROLLBACK");
+    } catch {
+      // A timed-out ROLLBACK may never reach PostgreSQL. Its transaction may
+      // still be open; destroy this client rather than let another request
+      // reuse it and accidentally commit the failed transaction's writes.
+      discard = true;
+    }
     throw e;
   } finally {
-    c.release();
+    c.release(discard ? true : undefined);
   }
 }

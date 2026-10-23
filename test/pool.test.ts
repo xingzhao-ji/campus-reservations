@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter, once } from "node:events";
 import pg from "pg";
-import { database, type Database } from "../src/db.js";
+import { database, tx, type Database } from "../src/db.js";
+import { randomBytes } from "node:crypto";
 import { app } from "../src/app.js";
 import { Reservations } from "../src/service.js";
 
@@ -120,6 +121,116 @@ test(
         server.close((e) => (e ? reject(e) : resolve())),
       );
       await Promise.all([pool.end(), control.end()]);
+    }
+  },
+);
+
+for (const failureAt of ["BEGIN", "WORK", "COMMIT"]) {
+  test(`failed rollback discards connection and preserves original ${failureAt} error`, async () => {
+    const original = new Error(`original ${failureAt} timeout`),
+      rollbackFailure = new Error("rollback timeout");
+    const statements: string[] = [],
+      released: unknown[] = [];
+    const connection = {
+      query: async (sql: string) => {
+        statements.push(sql);
+        if (sql === failureAt) throw original;
+        if (sql === "ROLLBACK") throw rollbackFailure;
+        return { rows: [] };
+      },
+      release: (discard?: Error | boolean) => {
+        released.push(discard);
+      },
+    };
+    const db: Database = {
+      connect: async () => connection,
+      query: async () => ({ rows: [] }),
+      end: async () => {},
+    };
+    await assert.rejects(
+      () => tx(db, (c) => c.query("WORK")),
+      (error) => error === original,
+    );
+    assert.equal(statements.at(-1), "ROLLBACK");
+    assert.deepEqual(released, [true]);
+  });
+}
+
+test("successful rollback safely releases once and preserves original failure", async () => {
+  const original = new Error("application failure"),
+    released: unknown[] = [];
+  const connection = {
+    query: async () => ({ rows: [] }),
+    release: (discard?: Error | boolean) => {
+      released.push(discard);
+    },
+  };
+  const db: Database = {
+    connect: async () => connection,
+    query: async () => ({ rows: [] }),
+    end: async () => {},
+  };
+  await assert.rejects(
+    () =>
+      tx(db, async () => {
+        throw original;
+      }),
+    (error) => error === original,
+  );
+  assert.deepEqual(released, [undefined]);
+});
+
+test(
+  "real PostgreSQL timed-out rollback cannot leak prior writes into the next transaction",
+  { skip: !process.env.TEST_DATABASE_URL, timeout: 15000 },
+  async () => {
+    const pool = database(process.env.TEST_DATABASE_URL) as pg.Pool;
+    // Use the production pool/helper, shortening only timeouts to reproduce the
+    // driver's queued-ROLLBACK timeout deterministically without a five-second wait.
+    pool.options.max = 1;
+    pool.options.query_timeout = 100;
+    const control = new pg.Pool({
+      connectionString: process.env.TEST_DATABASE_URL,
+    });
+    const table = `test_timeout_markers_${randomBytes(8).toString("hex")}`;
+    let firstPid: number | undefined,
+      inserted = false;
+    try {
+      await control.query(`CREATE TABLE ${table} (marker text NOT NULL)`);
+      await assert.rejects(
+        () =>
+          tx(pool as Database, async (c) => {
+            firstPid = (await c.query("SELECT pg_backend_pid() AS pid")).rows[0]
+              .pid;
+            await c.query(`INSERT INTO ${table} VALUES ('failed')`);
+            inserted = true;
+            await c.query("SELECT pg_sleep(0.6)");
+          }),
+        /timeout/i,
+      );
+      assert.equal(inserted, true);
+      assert.equal(typeof firstPid, "number");
+      assert.equal(pool.idleCount, 0);
+      // Let the old backend's slow statement finish before attempting another tx.
+      // Without discard, that tx would reuse the still-open transaction and commit
+      // its earlier 'failed' write together with the new 'healthy' write.
+      await control.query("SELECT pg_sleep(0.8)");
+      const secondPid = await tx(pool as Database, async (c) => {
+        const pid = (await c.query("SELECT pg_backend_pid() AS pid")).rows[0]
+          .pid;
+        await c.query(`INSERT INTO ${table} VALUES ('healthy')`);
+        return pid;
+      });
+      assert.notEqual(secondPid, firstPid);
+      assert.deepEqual(
+        (await control.query(`SELECT marker FROM ${table} ORDER BY marker`))
+          .rows,
+        [{ marker: "healthy" }],
+      );
+    } finally {
+      await pool.end();
+      await control.query(`DROP TABLE IF EXISTS ${table}`);
+      await control.end();
     }
   },
 );
